@@ -343,6 +343,8 @@ class MarkerModel:
     bcode: list
     ellipses: dict
     bcode_np: np.ndarray = None
+    bcode_rotations: np.ndarray = None
+    rotation_offsets: np.ndarray = None
 
 
 @dataclass
@@ -401,6 +403,9 @@ def load_model(path):
             matrix[1, 2] *= -1.0
             matrix[2, 1] *= -1.0
             ellipses[slot_idx] = matrix
+    bcode_np = np.asarray(bcode, dtype=np.bool_)
+    rotation_offsets = np.arange(0, len(bcode_np), num_layers, dtype=np.int32)
+    bcode_rotations = np.asarray([np.roll(bcode_np, -rotation) for rotation in rotation_offsets], dtype=np.bool_)
     return MarkerModel(
         name,
         world_size,
@@ -413,7 +418,9 @@ def load_model(path):
         idx,
         bcode,
         ellipses,
-        np.asarray(bcode, dtype=np.bool_),
+        bcode_np,
+        bcode_rotations,
+        rotation_offsets,
     )
 
 
@@ -636,7 +643,9 @@ class SlotFitter:
         return fit_off
 
     def build_code_for_layer(self, layer, num_layers, radius_sq, fit_slots, fit_slot_centers, slots_center):
-        code = [None] * (num_layers * len(fit_slots))
+        slot_count = num_layers * len(fit_slots)
+        values = np.zeros(slot_count, dtype=np.bool_)
+        payloads = [None] * slot_count
         fit_levels = []
         current_layer = -layer
         for _ in range(num_layers + 1):
@@ -649,11 +658,6 @@ class SlotFitter:
         for level in range(len(fit_levels) - 1, 0, -1):
             qmax = fit_levels[level]
             qmin = fit_levels[level - 1]
-            for i in range(len(fit_slots)):
-                k = 0 if i + 1 == len(fit_slots) else i + 1
-                idx = i * num_layers + level - 1
-                code[idx] = Slot(qmin=qmin, qmax=qmax, c=slots_center, v1=boundaries[i], v2=next_boundaries[i], slot_center=fit_slot_centers[k][level - 1])
-
             inside_qmax = points_in_ellipse(qmax, self.points_coords)
             inside_qmin = points_in_ellipse(qmin, self.points_coords)
             annulus_mask = candidate_mask & inside_qmax & (~inside_qmin)
@@ -677,15 +681,28 @@ class SlotFitter:
                 ellipse_idx = annulus_idx[local_idx]
                 slot_idx = int(point_slots[local_idx])
                 code_idx = slot_idx * num_layers + level - 1
-                slot = code[code_idx]
                 ellipse = self.ellipses[ellipse_idx]
-                if ellipse.contains(slot.slot_center):
-                    if not slot.value:
+                next_slot_idx = 0 if slot_idx + 1 == len(fit_slots) else slot_idx + 1
+                slot_center = fit_slot_centers[next_slot_idx][level - 1]
+                if ellipse.contains(slot_center):
+                    if not values[code_idx]:
                         filled_slots += 1
-                    slot.value = True
-                    slot.payload = ellipse
+                    values[code_idx] = True
+                    payloads[code_idx] = ellipse
 
             candidate_mask &= inside_qmin
+
+        code = [None] * slot_count
+        for level in range(len(fit_levels) - 1, 0, -1):
+            qmax = fit_levels[level]
+            qmin = fit_levels[level - 1]
+            for i in range(len(fit_slots)):
+                next_slot_idx = 0 if i + 1 == len(fit_slots) else i + 1
+                idx = i * num_layers + level - 1
+                slot = Slot(qmin=qmin, qmax=qmax, c=slots_center, v1=boundaries[i], v2=next_boundaries[i], slot_center=fit_slot_centers[next_slot_idx][level - 1])
+                slot.value = bool(values[idx])
+                slot.payload = payloads[idx]
+                code[idx] = slot
 
         return code, filled_slots
 
@@ -697,6 +714,8 @@ class MarkerDetector:
         self.min_pts_for_level = 4
         self.max_pair_checks = 192
         self.max_area_ratio = 1.8
+        self.max_pair_neighbors = 6
+        self.max_pair_distance_ratio = 12.0
 
     def to_ellipse_points(self, ellipses):
         points = []
@@ -719,14 +738,16 @@ class MarkerDetector:
         for model in self.models.values():
             if len(model.bcode_np) != len(candidate.code):
                 continue
-            for rotation in range(0, len(model.bcode_np), model.num_layers):
-                expected = np.roll(model.bcode_np, -rotation)
-                mismatches = observed != expected
-                errors = int(np.count_nonzero(mismatches))
-                discarded = int(np.count_nonzero(observed & mismatches))
-                score = (errors, discarded, -filled_slots)
-                if best is None or score < best[0]:
-                    best = (score, model, rotation, errors, discarded)
+            mismatches = model.bcode_rotations != observed
+            errors_by_rotation = np.count_nonzero(mismatches, axis=1)
+            discarded_by_rotation = np.count_nonzero(mismatches & observed[None, :], axis=1)
+            best_rotation_idx = int(np.lexsort((discarded_by_rotation, errors_by_rotation))[0])
+            errors = int(errors_by_rotation[best_rotation_idx])
+            discarded = int(discarded_by_rotation[best_rotation_idx])
+            rotation = int(model.rotation_offsets[best_rotation_idx])
+            score = (errors, discarded, -filled_slots)
+            if best is None or score < best[0]:
+                best = (score, model, rotation, errors, discarded)
         if best is None:
             return None
         _, model, rotation, errors, discarded = best
@@ -740,9 +761,14 @@ class MarkerDetector:
                 matched.invalidate_slot(i)
         return matched
 
+    def mark_assigned(self, marker):
+        for slot in marker.code:
+            if slot.value and not slot.discarded and slot.payload is not None:
+                slot.payload.unassigned = False
+
     def try_fit(self, fitter, markers_by_id):
         if not self.models:
-            return False
+            return None
         sample_model = next(iter(self.models.values()))
         possible_markers = fitter.fit(sample_model.radius_ratio, sample_model.gap_factor, sample_model.num_layers)
         for candidate in possible_markers:
@@ -752,8 +778,54 @@ class MarkerDetector:
             current = markers_by_id.get(matched.model.idx)
             if current is None or matched.num_filled_slots() > current.num_filled_slots():
                 markers_by_id[matched.model.idx] = matched
-            return True
-        return False
+                return matched
+            return current
+        return None
+
+    def candidate_pairs(self, centers, areas):
+        count = len(centers)
+        pair_i, pair_j = np.triu_indices(count, k=1)
+        if len(pair_i) == 0:
+            return pair_i, pair_j
+
+        min_area = np.minimum(areas[pair_i], areas[pair_j])
+        max_area = np.maximum(areas[pair_i], areas[pair_j])
+        area_ratio = max_area / np.maximum(min_area, 1e-9)
+        deltas = centers[pair_i] - centers[pair_j]
+        dist2 = np.einsum("ij,ij->i", deltas, deltas)
+        avg_diameter = np.sqrt(np.maximum((areas[pair_i] + areas[pair_j]) * 0.5, 1e-9))
+        distance_ratio = np.sqrt(dist2) / avg_diameter
+        valid = (area_ratio <= self.max_area_ratio) & (distance_ratio <= self.max_pair_distance_ratio)
+        if not np.any(valid):
+            return pair_i[:0], pair_j[:0]
+
+        pair_i = pair_i[valid]
+        pair_j = pair_j[valid]
+        area_ratio = area_ratio[valid]
+        distance_ratio = distance_ratio[valid]
+        score = area_ratio + 0.05 * distance_ratio
+        order = np.argsort(score)
+
+        if self.max_pair_neighbors <= 0:
+            order = order[: self.max_pair_checks]
+            return pair_i[order], pair_j[order]
+
+        neighbor_counts = np.zeros(count, dtype=np.int32)
+        selected = []
+        for idx in order:
+            i = int(pair_i[idx])
+            j = int(pair_j[idx])
+            if neighbor_counts[i] >= self.max_pair_neighbors or neighbor_counts[j] >= self.max_pair_neighbors:
+                continue
+            neighbor_counts[i] += 1
+            neighbor_counts[j] += 1
+            selected.append(idx)
+            if len(selected) >= self.max_pair_checks:
+                break
+        if not selected:
+            return pair_i[:0], pair_j[:0]
+        selected = np.asarray(selected, dtype=np.intp)
+        return pair_i[selected], pair_j[selected]
 
     def detect_rotated_rects(self, ellipses):
         markers_by_id = {}
@@ -767,27 +839,13 @@ class MarkerDetector:
 
         centers = np.asarray([ellipse.center() for ellipse in ellipse_points], dtype=np.float64)
         areas = np.asarray([ellipse.area for ellipse in ellipse_points], dtype=np.float64)
-        pair_i, pair_j = np.triu_indices(count, k=1)
-        min_area = np.minimum(areas[pair_i], areas[pair_j])
-        max_area = np.maximum(areas[pair_i], areas[pair_j])
-        area_ratio = max_area / np.maximum(min_area, 1e-9)
-        valid = area_ratio <= self.max_area_ratio
-        if not np.any(valid):
+        pair_i, pair_j = self.candidate_pairs(centers, areas)
+        if len(pair_i) == 0:
             return []
 
-        pair_i = pair_i[valid]
-        pair_j = pair_j[valid]
-        area_ratio = area_ratio[valid]
-        deltas = centers[pair_i] - centers[pair_j]
-        dist2 = np.einsum("ij,ij->i", deltas, deltas)
-        score = area_ratio + 0.002 * dist2
-        order = np.argsort(score)
-        limit = min(self.max_pair_checks, len(order))
-
-        for rank in range(limit):
-            idx = order[rank]
-            e1 = ellipse_points[int(pair_i[idx])]
-            e2 = ellipse_points[int(pair_j[idx])]
+        for rank in range(len(pair_i)):
+            e1 = ellipse_points[int(pair_i[rank])]
+            e2 = ellipse_points[int(pair_j[rank])]
             if e1.is_assigned() or e2.is_assigned():
                 continue
             fitter = EllipseFitter(e1, e2, self.intrinsics)
@@ -796,13 +854,21 @@ class MarkerDetector:
             fit1_min = fitter.get_fit1_with_offset(-2.3)
             fit1_max = fitter.get_fit1_with_offset(2.3)
             sf1 = SlotFitter(fitter.vr, ellipse_points, fit1_min, fit1_max, self.intrinsics, self.min_pts_for_level)
-            if sf1.valid and self.try_fit(sf1, markers_by_id):
+            matched = self.try_fit(sf1, markers_by_id) if sf1.valid else None
+            if matched is not None:
+                self.mark_assigned(matched)
+                if len(markers_by_id) == len(self.models):
+                    break
                 continue
             fit2_min = fitter.get_fit2_with_offset(-2.3)
             fit2_max = fitter.get_fit2_with_offset(2.3)
             sf2 = SlotFitter(fitter.vr, ellipse_points, fit2_min, fit2_max, self.intrinsics, self.min_pts_for_level)
             if sf2.valid:
-                self.try_fit(sf2, markers_by_id)
+                matched = self.try_fit(sf2, markers_by_id)
+                if matched is not None:
+                    self.mark_assigned(matched)
+                    if len(markers_by_id) == len(self.models):
+                        break
         return list(markers_by_id.values())
 
     def detect_image(self, image, ellipse_detector=None):
