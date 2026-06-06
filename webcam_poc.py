@@ -77,7 +77,7 @@ def draw_marker(frame, marker, origin):
     center = marker_center(marker)
     if center is None:
         return
-    label = str(marker.model.idx)
+    label = marker.model.name
     label_origin = (int(round(center[0] + ox)), int(round(center[1] + oy)))
     cv2.putText(frame, label, label_origin, cv2.FONT_HERSHEY_SIMPLEX, 1.0, RED, 3, cv2.LINE_AA)
 
@@ -114,6 +114,10 @@ def main():
     parser.add_argument("--cx", type=float)
     parser.add_argument("--cy", type=float)
     parser.add_argument("--process-width", type=int, default=640)
+    parser.add_argument("--max-detected", type=int, default=96)
+    parser.add_argument("--min-filled-slots", type=int, default=24)
+    parser.add_argument("--max-observed-errors", type=int, default=4)
+    parser.add_argument("--min-observed-match-ratio", type=float, default=0.85)
     args = parser.parse_args()
 
     models = load_models(args.models)
@@ -133,8 +137,14 @@ def main():
     intrinsics[1, 1] *= process_scale
     intrinsics[0, 2] *= process_scale
     intrinsics[1, 2] *= process_scale
-    marker_detector = MarkerDetector(intrinsics, models)
-    ellipse_detector = EllipseDetector(max_detected=36)
+    marker_detector = MarkerDetector(
+        intrinsics,
+        models,
+        min_filled_slots=args.min_filled_slots,
+        max_observed_errors=args.max_observed_errors,
+        min_observed_match_ratio=args.min_observed_match_ratio,
+    )
+    ellipse_detector = EllipseDetector(max_detected=args.max_detected)
     last_markers = []
     last_dt = 0.0
     origin = (float(intrinsics[0, 2]), float(intrinsics[1, 2]))

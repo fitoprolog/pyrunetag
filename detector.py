@@ -708,7 +708,14 @@ class SlotFitter:
 
 
 class MarkerDetector:
-    def __init__(self, intrinsics, models):
+    def __init__(
+        self,
+        intrinsics,
+        models,
+        min_filled_slots=24,
+        max_observed_errors=4,
+        min_observed_match_ratio=0.85,
+    ):
         self.intrinsics = intrinsics.astype(np.float64)
         self.models = {model.idx: model for model in models}
         self.min_pts_for_level = 4
@@ -716,6 +723,9 @@ class MarkerDetector:
         self.max_area_ratio = 1.8
         self.max_pair_neighbors = 6
         self.max_pair_distance_ratio = 12.0
+        self.min_filled_slots = min_filled_slots
+        self.max_observed_errors = max_observed_errors
+        self.min_observed_match_ratio = min_observed_match_ratio
 
     def to_ellipse_points(self, ellipses):
         points = []
@@ -734,23 +744,39 @@ class MarkerDetector:
             return None
         observed = np.fromiter((slot.value for slot in candidate.code), dtype=np.bool_, count=len(candidate.code))
         filled_slots = candidate.num_filled_slots()
+        if filled_slots < self.min_filled_slots:
+            return None
         best = None
+        runner_up = None
         for model in self.models.values():
             if len(model.bcode_np) != len(candidate.code):
                 continue
-            mismatches = model.bcode_rotations != observed
-            errors_by_rotation = np.count_nonzero(mismatches, axis=1)
-            discarded_by_rotation = np.count_nonzero(mismatches & observed[None, :], axis=1)
-            best_rotation_idx = int(np.lexsort((discarded_by_rotation, errors_by_rotation))[0])
-            errors = int(errors_by_rotation[best_rotation_idx])
-            discarded = int(discarded_by_rotation[best_rotation_idx])
+            expected = model.bcode_rotations
+            unexpected_by_rotation = np.count_nonzero(observed[None, :] & (~expected), axis=1)
+            matched_by_rotation = np.count_nonzero(observed[None, :] & expected, axis=1)
+            missing_by_rotation = np.count_nonzero((~observed[None, :]) & expected, axis=1)
+            best_rotation_idx = int(np.lexsort((missing_by_rotation, -matched_by_rotation, unexpected_by_rotation))[0])
+            discarded = int(unexpected_by_rotation[best_rotation_idx])
+            matched = int(matched_by_rotation[best_rotation_idx])
+            missing = int(missing_by_rotation[best_rotation_idx])
+            errors = discarded + missing
             rotation = int(model.rotation_offsets[best_rotation_idx])
-            score = (errors, discarded, -filled_slots)
+            score = (discarded, -matched, missing)
             if best is None or score < best[0]:
+                runner_up = best
                 best = (score, model, rotation, errors, discarded)
+            elif runner_up is None or score < runner_up[0]:
+                runner_up = (score, model, rotation, errors, discarded)
         if best is None:
             return None
         _, model, rotation, errors, discarded = best
+        matched = filled_slots - discarded
+        if discarded > self.max_observed_errors:
+            return None
+        if matched / float(filled_slots) < self.min_observed_match_ratio:
+            return None
+        if runner_up is not None and best[0][0] == runner_up[0][0] and best[0][1] == runner_up[0][1]:
+            return None
         if model.max_distance >= 0 and errors > model.max_distance:
             return None
         matched = DetectedMarker(code=list(candidate.code), vr=candidate.vr.copy(), model=model, offset=rotation, num_errors=errors, num_discarded=discarded, filled_slots=filled_slots)

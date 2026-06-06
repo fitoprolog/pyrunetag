@@ -47,16 +47,25 @@ The important outputs are:
 
 ## Detect From Webcam
 
-Run the webcam proof of concept:
+Run the webcam proof of concept with all descriptors in the current directory:
 
 ```bash
-python3 webcam_poc.py ./ --camera 0 --width 1280 --height 720 --fx 1200 --fy 1200 --cx 640 --cy 360 --process-width 640
+python3 webcam_poc.py ./
 ```
 
-If you have a single descriptor, you can point directly to it:
+The webcam overlay displays the descriptor name, such as `TAG0`, instead of the internal RUNETag codebook id.
+
+By default the webcam detector is conservative to avoid misclassifying partial or noisy detections. These options control that behavior:
+
+- `--max-detected` limits how many ellipse candidates are passed to the marker matcher; the default is `96`
+- `--min-filled-slots` requires a candidate to contain enough observed dots before it can match; the default is `24`
+- `--max-observed-errors` rejects candidates with too many observed dots that do not belong to the chosen descriptor; the default is `4`
+- `--min-observed-match-ratio` requires most observed dots to agree with the chosen descriptor; the default is `0.85`
+
+For a noisier camera feed, loosen the thresholds:
 
 ```bash
-python3 webcam_poc.py tag0.txt --camera 0 --width 1280 --height 720 --fx 1200 --fy 1200 --cx 640 --cy 360 --process-width 640
+python3 webcam_poc.py ./ --max-observed-errors 6 --min-filled-slots 18
 ```
 
 Press `q` or `Esc` to quit.
@@ -72,6 +81,6 @@ python3 detector.py frame.png tag0.txt --fx 1200 --fy 1200 --cx 640 --cy 360
 ## Notes
 
 - `--tag-index` is the row index inside `codes.txt`
-- the detector displays the marker `idx` stored in the descriptor, which is the RUNETag codebook id
+- the webcam display shows the descriptor name, such as `TAG0`; the lower-level detector still stores the RUNETag codebook `idx`
 - the webcam script accepts either one descriptor file or a directory containing descriptor files
 - performance is still under active work, especially on the marker-present path
